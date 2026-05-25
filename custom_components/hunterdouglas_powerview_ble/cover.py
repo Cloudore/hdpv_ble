@@ -1,5 +1,6 @@
 """Hunter Douglas Powerview cover."""
 
+import time
 from typing import Any, Final
 
 from bleak.exc import BleakError
@@ -65,9 +66,11 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         self._attr_name = CoverDeviceClass.SHADE
         self._coord: PVCoordinator = coordinator
         self._attr_device_info = self._coord.device_info
-        self._target_position: int | None = round(
-            self._coord.data.get(ATTR_CURRENT_POSITION, OPEN_POSITION)
-        )
+        self._target_position: int | None = None
+        # Wall-clock timestamp of the last command that set _target_position.
+        # Used by is_opening / is_closing to expire stale targets after
+        # TARGET_TTL seconds (see those properties for the rationale).
+        self._target_set_at: float | None = None
         self._attr_unique_id = (
             f"{DOMAIN}_{format_mac(self._coord.address)}_{CoverDeviceClass.SHADE}"
         )
@@ -89,32 +92,65 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         """
         return super().available and self._coord.data_available
 
+    # Direction inference. The shade's advert movement bits are
+    # unreliable: KDT curtain firmwares invert is_opening / is_closing
+    # vs ACR rollers, and with multiple BLE proxies in the same home,
+    # adverts arrive out of order with ±1-3% position bounce that
+    # produces "closing" flickers during smooth opens.
+    #
+    # Direction is derived from intent — _target_position (set by every
+    # HA / HomeKit command) vs current_position. While the shade is more
+    # than DIRECTION_DEADZONE percent away from its commanded target, we
+    # report the corresponding "opening" or "closing" state; once it's
+    # within the deadzone, the target is considered reached and we fall
+    # through to the open/closed steady state.
+    #
+    # The target also auto-expires after TARGET_TTL seconds of inactivity
+    # so a stale command can't make the entity report "opening" forever
+    # when the user has since moved the shade by remote.
+
+    DIRECTION_DEADZONE = 2
+    TARGET_TTL = 60.0  # seconds since last command
+
+    def _target_is_fresh(self) -> bool:
+        if self._target_position is None or self._target_set_at is None:
+            return False
+        return (time.time() - self._target_set_at) < self.TARGET_TTL
+
     @property
     def is_opening(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
-        """Return if the cover is opening or not.
-
-        Uses only the V2 advert movement bit. The previous implementation
-        also fell back to (target_position > current_position AND
-        api.is_connected), which permanently latches after a command:
-        _target_position never resets, api.is_connected flickers as BLE
-        connections come and go, and the entity ends up reporting
-        "opening" minutes after the shade has physically settled.
-        """
-        return bool(self._coord.data.get("is_opening"))
+        """True while a fresh command is still driving the shade upward."""
+        if not self._target_is_fresh():
+            return False
+        current = self.current_cover_position
+        if current is None:
+            return False
+        return self._target_position > current + self.DIRECTION_DEADZONE
 
     @property
     def is_closing(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
-        """Return if the cover is closing or not.
-
-        Uses only the V2 advert movement bit (see is_opening docstring
-        for why the target-position fallback was removed).
-        """
-        return bool(self._coord.data.get("is_closing"))
+        """True while a fresh command is still driving the shade downward."""
+        if not self._target_is_fresh():
+            return False
+        current = self.current_cover_position
+        if current is None:
+            return False
+        return self._target_position < current - self.DIRECTION_DEADZONE
 
     @property
-    def is_closed(self) -> bool:  # type: ignore[reportIncompatibleVariableOverride]
-        """Return if the cover is closed."""
-        return self.current_cover_position == CLOSED_POSITION
+    def is_closed(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
+        """Return if the cover is closed.
+
+        Uses the same DIRECTION_DEADZONE as is_opening / is_closing so a
+        motor that settles 1-2% short of fully closed (common end-of-
+        travel calibration drift) doesn't bounce between "open" and
+        "closed" in HomeKit. Returns None when position is unknown so
+        HA reports the entity as 'unknown' rather than assuming "open".
+        """
+        pos = self.current_cover_position
+        if pos is None:
+            return None
+        return pos <= CLOSED_POSITION + self.DIRECTION_DEADZONE
 
     @property
     def supported_features(self) -> CoverEntityFeature:  # type: ignore[reportIncompatibleVariableOverride]
@@ -144,53 +180,64 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         return bool(self._coord.data.get("low_power_mode"))
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
-        """Move the cover to a specific position."""
+        """Move the cover to a specific position.
+
+        State updates are driven exclusively by incoming BLE adverts via
+        the coordinator → entity update path. Writing state optimistically
+        after the BLE call produces spurious "closed → closing → closed"
+        and "open → opening → open" ghost transitions whenever an advert
+        with stale position arrives during the ~500ms BLE round-trip.
+        """
         target_position: Final = kwargs.get(ATTR_POSITION)
-        if target_position is not None:
-            LOGGER.debug("set cover to position %f", target_position)
-            if self.current_cover_position == round(target_position) and not (
-                self.is_closing or self.is_opening
-            ):
-                return
-            self._target_position = round(target_position)
-            try:
-                await self._coord.api.set_position(
-                    round(target_position), wake_first=self._needs_wake
-                )
-                self.async_write_ha_state()
-            except BleakError as err:
-                LOGGER.error(
-                    "Failed to move cover '%s' to %f%%: %s",
-                    self.name,
-                    target_position,
-                    err,
-                )
+        if target_position is None:
+            return
+        LOGGER.debug("set cover to position %f", target_position)
+        if self.current_cover_position == round(target_position) and not (
+            self.is_closing or self.is_opening
+        ):
+            return
+        self._set_target(round(target_position))
+        try:
+            await self._coord.api.set_position(
+                round(target_position), wake_first=self._needs_wake
+            )
+        except BleakError as err:
+            LOGGER.error(
+                "Failed to move cover '%s' to %f%%: %s",
+                self.name,
+                target_position,
+                err,
+            )
+
+    def _set_target(self, position: int) -> None:
+        """Record a new target position and stamp its freshness window."""
+        self._target_position = position
+        self._target_set_at = time.time()
 
     def _reset_target_position(self) -> None:
         self._target_position = None
+        self._target_set_at = None
 
     async def async_open_cover(self, **kwargs: Any) -> None:
-        """Open the cover."""
+        """Open the cover. State driven by BLE adverts, not optimistic write."""
         LOGGER.debug("open cover")
         if self.current_cover_position == OPEN_POSITION:
             return
         try:
-            self._target_position = OPEN_POSITION
+            self._set_target(OPEN_POSITION)
             await self._coord.api.open(wake_first=self._needs_wake)
-            self.async_write_ha_state()
         except BleakError as err:
             LOGGER.error("Failed to open cover '%s': %s", self.name, err)
             self._reset_target_position()
 
     async def async_close_cover(self, **kwargs: Any) -> None:
-        """Close the cover tilt."""
+        """Close the cover. State driven by BLE adverts, not optimistic write."""
         LOGGER.debug("close cover")
         if self.current_cover_position == CLOSED_POSITION:
             return
         try:
-            self._target_position = CLOSED_POSITION
+            self._set_target(CLOSED_POSITION)
             await self._coord.api.close(wake_first=self._needs_wake)
-            self.async_write_ha_state()
         except BleakError as err:
             LOGGER.error("Failed to close cover '%s': %s", self.name, err)
             self._reset_target_position()

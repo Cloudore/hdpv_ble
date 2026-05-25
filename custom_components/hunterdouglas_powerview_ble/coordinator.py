@@ -167,25 +167,16 @@ class PVCoordinator(PassiveBluetoothDataUpdateCoordinator):
                 # are present (Cipher is built only on a 16-byte HOME_KEY).
                 self.api.encrypted = bool(self.data.pop("home_id", 0))
                 self._last_v2_ts = time.time()
-                # Override the V2 movement bits with the direction inferred
-                # from position delta. Some KDT curtain firmwares encode
-                # the is_opening/is_closing bits with the opposite meaning
-                # of ACR rollers — symptom was HomeKit showing "Closing"
-                # while a curtain was physically opening. Position itself
-                # is unambiguous: increasing = opening, decreasing = closing,
-                # stable = stopped.
-                new_pos = self.data.get(ATTR_CURRENT_POSITION)
-                if new_pos is not None and self._last_position is not None:
-                    if new_pos > self._last_position:
-                        self.data["is_opening"] = True
-                        self.data["is_closing"] = False
-                    elif new_pos < self._last_position:
-                        self.data["is_opening"] = False
-                        self.data["is_closing"] = True
-                    else:
-                        self.data["is_opening"] = False
-                        self.data["is_closing"] = False
-                self._last_position = new_pos
+                # Movement direction is derived in the cover entity from
+                # _target_position vs current_position, not from these
+                # advert bits. Bits are unreliable: KDT curtain firmwares
+                # invert them vs ACR rollers, and with multiple BLE
+                # proxies the same shade's adverts arrive out of order
+                # with ±1-3% position bounce that produces "closing"
+                # flickers during smooth opens. Clear the bits so the
+                # cover entity falls through to target-based inference.
+                self.data["is_opening"] = False
+                self.data["is_closing"] = False
 
         LOGGER.debug("data sample %s", self.data)
         super()._async_handle_bluetooth_event(service_info, change)

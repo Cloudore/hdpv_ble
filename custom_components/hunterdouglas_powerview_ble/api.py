@@ -146,40 +146,65 @@ class PowerViewBLE:
 
     # general cmd: uint16_t cmd, uint8_t seqID, uint8_t data_len
     async def _cmd(self, cmd: tuple[ShadeCmd, bytes], disconnect: bool = True) -> None:
+        """Send one BLE command, draining any commands queued while we send.
+
+        If another _cmd call lands while we hold the connection (typical for
+        HomeKit users tapping close while a shade is still opening), it
+        updates self._cmd_next and returns. We then keep the same BLE
+        session open and immediately run that newer command too, so user
+        intent is honoured without waiting for the in-flight BLE write
+        to complete or a subsequent press to re-fire.
+        """
         self._cmd_next = cmd
         if self._cmd_lock.locked():
-            LOGGER.debug("%s: device busy, queuing %s command", self.name, cmd[0])
+            LOGGER.debug("%s: device busy, queueing %s", self.name, cmd[0])
             return
 
         async with self._cmd_lock:
             try:
                 await self._connect()
-                cmd_run: tuple[ShadeCmd, bytes] = self._cmd_next
-                tx_data: bytes = bytes(
-                    int.to_bytes(cmd_run[0].value, 2, byteorder="little")
-                    + bytes([self._seqcnt, len(cmd_run[1])])
-                    + cmd_run[1]
-                )
-                LOGGER.debug("sending cmd: %s", tx_data.hex(" "))
-                if self._cipher is not None and self._is_encrypted:
-                    enc: AEADEncryptionContext = self._cipher.encryptor()
-                    tx_data = enc.update(tx_data) + enc.finalize()
-                    LOGGER.debug("  encrypted: %s", tx_data.hex(" "))
-                self._data_event.clear()
-                await self._client.write_gatt_char(UUID_TX, tx_data, False)
-                self._seqcnt += 1
-                LOGGER.debug("waiting for response")
-                try:
-                    await asyncio.wait_for(self._wait_event(), timeout=TIMEOUT)
-                    self._verify_response(self._data, self._seqcnt - 1, cmd_run[0])
-                except TimeoutError as ex:
-                    raise TimeoutError("Device did not send confirmation.") from ex
-                finally:
-                    if disconnect:
-                        await self._client.disconnect()  # device disconnects itself
+                while True:
+                    cmd_run: tuple[ShadeCmd, bytes] = self._cmd_next
+                    tx_data: bytes = bytes(
+                        int.to_bytes(cmd_run[0].value, 2, byteorder="little")
+                        + bytes([self._seqcnt, len(cmd_run[1])])
+                        + cmd_run[1]
+                    )
+                    LOGGER.debug("sending cmd: %s", tx_data.hex(" "))
+                    if self._cipher is not None and self._is_encrypted:
+                        enc: AEADEncryptionContext = self._cipher.encryptor()
+                        tx_data = enc.update(tx_data) + enc.finalize()
+                        LOGGER.debug("  encrypted: %s", tx_data.hex(" "))
+                    self._data_event.clear()
+                    await self._client.write_gatt_char(UUID_TX, tx_data, False)
+                    self._seqcnt += 1
+                    LOGGER.debug("waiting for response")
+                    try:
+                        await asyncio.wait_for(self._wait_event(), timeout=TIMEOUT)
+                        self._verify_response(self._data, self._seqcnt - 1, cmd_run[0])
+                    except TimeoutError as ex:
+                        # Don't keep retrying queued commands after a timeout
+                        # — surface the error to the caller.
+                        raise TimeoutError(
+                            "Device did not send confirmation."
+                        ) from ex
+                    # If nothing new was queued during this send, we're done.
+                    if self._cmd_next is cmd_run:
+                        break
+                    LOGGER.debug(
+                        "%s: draining queued %s on the same connection",
+                        self.name,
+                        self._cmd_next[0],
+                    )
             except Exception as ex:
                 LOGGER.error("Error: %s - %s", type(ex).__name__, ex)
                 raise
+            finally:
+                if disconnect:
+                    try:
+                        await self._client.disconnect()  # device disconnects itself
+                    except BleakError:
+                        pass
 
     @staticmethod
     def dec_manufacturer_data(data: bytearray) -> list[tuple[str, float]]:
