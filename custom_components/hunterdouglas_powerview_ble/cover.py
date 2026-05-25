@@ -91,23 +91,25 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @property
     def is_opening(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
-        """Return if the cover is opening or not."""
-        return bool(self._coord.data.get("is_opening")) or (
-            isinstance(self._target_position, int)
-            and isinstance(self.current_cover_position, int)
-            and self._target_position > self.current_cover_position
-            and self._coord.api.is_connected
-        )
+        """Return if the cover is opening or not.
+
+        Uses only the V2 advert movement bit. The previous implementation
+        also fell back to (target_position > current_position AND
+        api.is_connected), which permanently latches after a command:
+        _target_position never resets, api.is_connected flickers as BLE
+        connections come and go, and the entity ends up reporting
+        "opening" minutes after the shade has physically settled.
+        """
+        return bool(self._coord.data.get("is_opening"))
 
     @property
     def is_closing(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
-        """Return if the cover is closing or not."""
-        return bool(self._coord.data.get("is_closing")) or (
-            isinstance(self._target_position, int)
-            and isinstance(self.current_cover_position, int)
-            and self._target_position < self.current_cover_position
-            and self._coord.api.is_connected
-        )
+        """Return if the cover is closing or not.
+
+        Uses only the V2 advert movement bit (see is_opening docstring
+        for why the target-position fallback was removed).
+        """
+        return bool(self._coord.data.get("is_closing"))
 
     @property
     def is_closed(self) -> bool:  # type: ignore[reportIncompatibleVariableOverride]
