@@ -182,11 +182,13 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position.
 
-        State updates are driven exclusively by incoming BLE adverts via
-        the coordinator → entity update path. Writing state optimistically
-        after the BLE call produces spurious "closed → closing → closed"
-        and "open → opening → open" ghost transitions whenever an advert
-        with stale position arrives during the ~500ms BLE round-trip.
+        State is written immediately (before the BLE await) so the entity
+        is in 'opening'/'closing' from the instant the command lands. HA's
+        HomeKit Bridge resets HK's TargetPosition to CurrentPosition any
+        time the entity is *not* in a moving state — if even a single
+        non-moving frame leaks through during the command's BLE round-trip,
+        HK forgets the user's actual target and ends up displaying the
+        direction backwards for the rest of the move.
         """
         target_position: Final = kwargs.get(ATTR_POSITION)
         if target_position is None:
@@ -197,6 +199,7 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         ):
             return
         self._set_target(round(target_position))
+        self.async_write_ha_state()
         try:
             await self._coord.api.set_position(
                 round(target_position), wake_first=self._needs_wake
@@ -219,24 +222,26 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         self._target_set_at = None
 
     async def async_open_cover(self, **kwargs: Any) -> None:
-        """Open the cover. State driven by BLE adverts, not optimistic write."""
+        """Open the cover. Write moving state immediately so HK keeps Target."""
         LOGGER.debug("open cover")
         if self.current_cover_position == OPEN_POSITION:
             return
+        self._set_target(OPEN_POSITION)
+        self.async_write_ha_state()
         try:
-            self._set_target(OPEN_POSITION)
             await self._coord.api.open(wake_first=self._needs_wake)
         except BleakError as err:
             LOGGER.error("Failed to open cover '%s': %s", self.name, err)
             self._reset_target_position()
 
     async def async_close_cover(self, **kwargs: Any) -> None:
-        """Close the cover. State driven by BLE adverts, not optimistic write."""
+        """Close the cover. Write moving state immediately so HK keeps Target."""
         LOGGER.debug("close cover")
         if self.current_cover_position == CLOSED_POSITION:
             return
+        self._set_target(CLOSED_POSITION)
+        self.async_write_ha_state()
         try:
-            self._set_target(CLOSED_POSITION)
             await self._coord.api.close(wake_first=self._needs_wake)
         except BleakError as err:
             LOGGER.error("Failed to close cover '%s': %s", self.name, err)
