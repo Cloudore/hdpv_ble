@@ -81,6 +81,16 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         # entity is not in a moving state — breaking the iOS direction
         # label for the rest of the move. See _pin_direction().
         self._pinned_direction: str | None = None
+        # Last advertised position + when it last changed. Used by
+        # `_has_settled()` to decide whether the motor is still moving.
+        # Without this, is_opening/is_closing fall to False at the same
+        # advert where the shade enters DIRECTION_DEADZONE of its target,
+        # which leaves a non-moving "open"/"closed" frame *while the motor
+        # is still physically running*. HA's HomeKit Bridge clobbers HK's
+        # TargetPosition on any non-moving frame, so that single transient
+        # frame flips iOS's direction label for the rest of the move.
+        self._last_position: int | None = None
+        self._last_position_change_ts: float | None = None
         self._attr_unique_id = (
             f"{DOMAIN}_{format_mac(self._coord.address)}_{CoverDeviceClass.SHADE}"
         )
@@ -89,14 +99,12 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
     async def async_added_to_hass(self) -> None:
         """Subscribe to HomeKit Bridge's command event for pre-emptive pinning.
 
-        HA's HomeKit Bridge fires `homekit_state_change` SYNCHRONOUSLY when
-        iOS writes the TargetPosition characteristic, before the
-        cover.set_cover_position service-call task is even queued. By
-        pinning the direction inside that event handler we beat any
-        racing BLE advert that would otherwise fire async_write_ha_state
-        with a non-moving state and trip the Bridge into resetting
-        HK's TargetPosition (which then flips the iOS direction label
-        for the rest of the move).
+        HA's HomeKit Bridge fires `homekit_state_change` synchronously inside
+        the TargetPosition setter callback, before the service-call task is
+        queued. Pinning the direction in that synchronous frame beats any
+        racing BLE advert that would otherwise write a non-moving state and
+        trip the Bridge into resetting HK's TargetPosition (which flips the
+        iOS direction label for the whole move).
         """
         await super().async_added_to_hass()
         self.async_on_remove(
@@ -105,15 +113,7 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @callback
     def _on_homekit_event(self, event: Event) -> None:
-        """Pin direction the moment iOS issues a position command.
-
-        Filters to this entity's set_cover_position events only. Pins so a
-        BLE advert that lands between this event and the service-call task
-        running can't write a non-moving state and trip the Bridge into
-        clobbering HK's TargetPosition. If the service-call task never
-        runs (e.g. entity briefly went unavailable), the pin self-expires
-        via `_pin_is_valid` after TARGET_TTL.
-        """
+        """Pin direction the moment iOS issues a position command."""
         if event.data.get(ATTR_ENTITY_ID) != self.entity_id:
             return
         if event.data.get("service") != "set_cover_position":
@@ -162,29 +162,22 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         return not self._coord.data_available
 
     # Direction inference. The shade's advert movement bits are
-    # unreliable: KDT curtain firmwares invert is_opening / is_closing
-    # vs ACR rollers, and with multiple BLE proxies in the same home,
-    # adverts arrive out of order with ±1-3% position bounce that
-    # produces "closing" flickers during smooth opens.
+    # unreliable (KDT curtain firmwares invert them vs ACR rollers), so
+    # we derive direction from intent: `_target_position` (set by every
+    # HA / HomeKit command) compared against `current_position`. While
+    # the target is fresh AND the motor is still moving (see
+    # `_has_settled()`), we report "opening" / "closing"; once the motor
+    # has gone quiet we fall through to the open/closed steady state.
     #
-    # Direction is derived from intent — _target_position (set by every
-    # HA / HomeKit command) vs current_position. While the shade is more
-    # than DIRECTION_DEADZONE percent away from its commanded target, we
-    # report the corresponding "opening" or "closing" state; once it's
-    # within the deadzone, the target is considered reached and we fall
-    # through to the open/closed steady state.
-    #
-    # The target also auto-expires after TARGET_TTL seconds of inactivity
-    # so a stale command can't make the entity report "opening" forever
-    # when the user has since moved the shade by remote.
+    # The target auto-expires after TARGET_TTL seconds so a stale command
+    # can't make the entity report "opening" forever when the user has
+    # since moved the shade by remote.
 
-    DIRECTION_DEADZONE = 2
-    ENDPOINT_DEADZONE = 5  # is_closed deadzone — wider than DIRECTION_DEADZONE
-    # to absorb noisy adverts that briefly report 3-4 from a settled-closed
-    # shade and would otherwise flip the entity from "closed" to "open" right
-    # before a HomeKit command runs, tripping HA's Bridge into resetting
-    # HK's TargetPosition.
-    TARGET_TTL = 60.0  # seconds since last command
+    ENDPOINT_DEADZONE = 5  # is_closed deadzone, absorbs ±2-3% advert noise
+    # from a settled-closed shade so it doesn't flip "closed" → "open"
+    # → "closed" while sitting at the bottom.
+    TARGET_TTL = 60.0  # seconds since last command — pin/target window
+    SETTLED_AFTER = 1.5  # seconds without position change = motor stopped
 
     def _target_is_fresh(self) -> bool:
         if self._target_position is None or self._target_set_at is None:
@@ -203,6 +196,22 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         """
         return self._pinned_direction is not None and self._target_is_fresh()
 
+    def _has_settled(self) -> bool:
+        """True iff the last position change was longer than SETTLED_AFTER ago.
+
+        Position-stability proxy for "motor stopped". Used by is_opening /
+        is_closing to keep the entity in a moving state through the *last
+        few percent* of a move where the position is still ticking up but
+        within a naive `target - current` deadzone would already snap to
+        "open"/"closed". A single such non-moving frame is enough for HA's
+        HomeKit Bridge to clobber HK's TargetPosition (it resets Target to
+        Current whenever the entity is not in MOVING_STATES) — which then
+        flips iOS's direction label backwards for the rest of the move.
+        """
+        if self._last_position_change_ts is None:
+            return True  # never seen a position → not moving
+        return (time.time() - self._last_position_change_ts) > self.SETTLED_AFTER
+
     @property
     def is_opening(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
         """True while the shade is being driven upward."""
@@ -213,7 +222,11 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         current = self.current_cover_position
         if current is None:
             return False
-        return self._target_position > current + self.DIRECTION_DEADZONE
+        if self._target_position <= current:
+            return False
+        # Target is above us. Still "opening" until either the position
+        # matches the target exactly or the motor has gone quiet.
+        return not self._has_settled()
 
     @property
     def is_closing(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
@@ -225,7 +238,9 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         current = self.current_cover_position
         if current is None:
             return False
-        return self._target_position < current - self.DIRECTION_DEADZONE
+        if self._target_position >= current:
+            return False
+        return not self._has_settled()
 
     @property
     def is_closed(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
@@ -234,6 +249,21 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         if pos is None:
             return None
         return pos <= CLOSED_POSITION + self.ENDPOINT_DEADZONE
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Track position-change timestamps for `_has_settled()` then propagate.
+
+        Only override is the position-change timestamping; the state write is
+        still done by the parent so HomeKit gets a live `current_position`
+        update on every advert.
+        """
+        current = self.current_cover_position
+        if current is not None and current != self._last_position:
+            self._last_position = current
+            self._last_position_change_ts = time.time()
+        super()._handle_coordinator_update()
+
 
     @property
     def supported_features(self) -> CoverEntityFeature:  # type: ignore[reportIncompatibleVariableOverride]
@@ -307,14 +337,6 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         otherwise compute from target-vs-current. Pass None to release.
         """
         self._pinned_direction = direction
-
-    # _handle_coordinator_update is NOT overridden anymore — every BLE
-    # advert should drive an async_write_ha_state so HomeKit gets live
-    # CurrentPosition updates while the shade physically moves. The pin
-    # (set by either _on_homekit_event or the command method itself)
-    # ensures is_opening / is_closing return True throughout, so each
-    # advert-driven state recomputation stays in a moving state and
-    # never trips the Bridge into resetting HK's TargetPosition.
 
     def _reset_target_position(self) -> None:
         self._target_position = None
