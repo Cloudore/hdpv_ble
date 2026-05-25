@@ -202,6 +202,14 @@ class PowerViewBLE:
             ("battery_level", POWER_LEVELS[(data[8] >> 6)]),  # cannot hit 4
             ("resetMode", bool(data[8] & 0x1)),
             ("resetClock", bool(data[8] & 0x2)),
+            # Bit 0x04 observed set on shades that ACK BLE commands with
+            # error_code=0 but refuse to physically move — likely a
+            # "needs calibration / service required" flag the motor sets
+            # after losing its position reference (factory reset, encoder
+            # fault, or running past a limit). The bit clears once the
+            # motor has been re-calibrated via the PowerView app or
+            # driven through its full range with the physical remote.
+            ("service_required", bool(data[8] & 0x4)),
         ]
 
     # position cmd: uint16_t pos1, uint16_t pos2, uint16_t pos3, uint16_t tilt, uint8_t velocity

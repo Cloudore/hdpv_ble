@@ -42,5 +42,12 @@
         "error": {
             "cannot_connect": "Could not reach the gateway or extract a home key. Check the address and that the gateway has paired shades."
         }
+    },
+    "entity": {
+        "binary_sensor": {
+            "service_required": {
+                "name": "Service required"
+            }
+        }
     }
 }

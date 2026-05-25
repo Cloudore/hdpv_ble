@@ -8,7 +8,7 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.components.bluetooth.passive_update_coordinator import (
     PassiveBluetoothCoordinatorEntity,
 )
-from homeassistant.const import ATTR_BATTERY_CHARGING
+from homeassistant.const import ATTR_BATTERY_CHARGING, EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -22,7 +22,13 @@ BINARY_SENSOR_TYPES: list[BinarySensorEntityDescription] = [
         key=ATTR_BATTERY_CHARGING,
         translation_key=ATTR_BATTERY_CHARGING,
         device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
-    )
+    ),
+    BinarySensorEntityDescription(
+        key="service_required",
+        translation_key="service_required",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
 ]
 
 

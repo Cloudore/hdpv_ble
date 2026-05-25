@@ -7,7 +7,7 @@ DOMAIN: Final[str] = "hunterdouglas_powerview_ble"
 LOGGER: Final = logging.getLogger(__package__)
 MFCT_ID: Final[int] = 2073
 TIMEOUT: Final[int] = 5
-STALE_AFTER: Final[float] = 300.0  # seconds without a V2 advert before entity is unavailable
+STALE_AFTER: Final[float] = 1800.0  # seconds without a V2 advert before entity is unavailable (idle shades back off BLE cadence; 30 min covers typical slow-down)
 
 # Config flow form field
 CONF_HOST: Final[str] = "host"
