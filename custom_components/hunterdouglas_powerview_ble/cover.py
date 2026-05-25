@@ -178,6 +178,12 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
     # → "closed" while sitting at the bottom.
     TARGET_TTL = 60.0  # seconds since last command — pin/target window
     SETTLED_AFTER = 1.5  # seconds without position change = motor stopped
+    # Maximum position change a single advert is allowed to report. Larger
+    # jumps are rejected as spurious (stale beacon from a flaky BLE proxy
+    # or an init/boot advert from the shade module after it wakes — both
+    # frequently report pos=0 mid-motion). Physical roller motion is
+    # ~7%/sec, so even a 5-second advert gap caps real change at ~35%.
+    MAX_POSITION_JUMP = 50
 
     def _target_is_fresh(self) -> bool:
         if self._target_position is None or self._target_set_at is None:
@@ -266,13 +272,36 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Track position-change timestamps for `_has_settled()` then propagate.
+        """Filter spurious position jumps, then track + propagate.
 
-        Only override is the position-change timestamping; the state write is
-        still done by the parent so HomeKit gets a live `current_position`
-        update on every advert.
+        Two responsibilities:
+
+        1. Reject single-advert position jumps larger than MAX_POSITION_JUMP.
+           These are physically impossible (a roller can't move 50%+ between
+           two adverts) and in practice come from stale BLE-proxy beacons or
+           the shade's init/boot advert (pos=0, resetClock=False) right when
+           the motor settles. Without the filter, one such frame mid-motion
+           is enough to write a moving state in the *wrong direction* —
+           e.g. on a 100→70 close, a stray pos=0 advert flips is_opening
+           to True (because target=70 > current=0) and stamps HK's
+           PositionState as INCREASING, leaving iOS stuck on "Opening...".
+
+        2. Track when the position last actually changed for `_has_settled()`.
+
+        Skipped adverts don't update `_last_position` so the next good advert
+        is judged against the last *good* value.
         """
         current = self.current_cover_position
+        if (
+            current is not None
+            and self._last_position is not None
+            and abs(current - self._last_position) > self.MAX_POSITION_JUMP
+        ):
+            LOGGER.debug(
+                "%s: rejecting spurious position jump %s → %s",
+                self.entity_id, self._last_position, current,
+            )
+            return
         if current is not None and current != self._last_position:
             self._last_position = current
             self._last_position_change_ts = time.time()
