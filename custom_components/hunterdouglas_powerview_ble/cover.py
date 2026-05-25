@@ -18,8 +18,8 @@ from homeassistant.components.cover import (
     CoverEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_CLOSING, STATE_OPENING
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import ATTR_ENTITY_ID, STATE_CLOSING, STATE_OPENING
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo, format_mac
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -85,6 +85,51 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
             f"{DOMAIN}_{format_mac(self._coord.address)}_{CoverDeviceClass.SHADE}"
         )
         super().__init__(coordinator)
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to HomeKit Bridge's command event for pre-emptive pinning.
+
+        HA's HomeKit Bridge fires `homekit_state_change` SYNCHRONOUSLY when
+        iOS writes the TargetPosition characteristic, before the
+        cover.set_cover_position service-call task is even queued. By
+        pinning the direction inside that event handler we beat any
+        racing BLE advert that would otherwise fire async_write_ha_state
+        with a non-moving state and trip the Bridge into resetting
+        HK's TargetPosition (which then flips the iOS direction label
+        for the rest of the move).
+        """
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                "homekit_state_change", self._on_homekit_event
+            )
+        )
+
+    @callback
+    def _on_homekit_event(self, event: Event) -> None:
+        """Pin direction the moment iOS issues a position command."""
+        if event.data.get(ATTR_ENTITY_ID) != self.entity_id:
+            return
+        if event.data.get("service") != "set_cover_position":
+            return
+        value = event.data.get("value")
+        if not isinstance(value, (int, float)):
+            return
+        current = self.current_cover_position
+        if current is None or int(value) == current:
+            return
+        direction = STATE_OPENING if int(value) > current else STATE_CLOSING
+        LOGGER.debug(
+            "%s: HomeKit command target=%s current=%s -> pinning %s",
+            self.entity_id,
+            int(value),
+            current,
+            direction,
+        )
+        self._pin_direction(direction)
+        # Pre-set target so subsequent state recomputes are consistent.
+        self._set_target(int(value))
+        self.async_write_ha_state()
 
     @property
     def device_info(self) -> DeviceInfo:  # type: ignore[reportIncompatibleVariableOverride]
