@@ -135,6 +135,14 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         pos: Final = self._coord.data.get(ATTR_CURRENT_POSITION)
         return round(pos) if pos is not None else None
 
+    @property
+    def _needs_wake(self) -> bool:
+        """True when the shade is in low-power state and needs a double-send.
+
+        See api.set_position(wake_first=...) for the rationale.
+        """
+        return bool(self._coord.data.get("service_required"))
+
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position."""
         target_position: Final = kwargs.get(ATTR_POSITION)
@@ -146,7 +154,9 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
                 return
             self._target_position = round(target_position)
             try:
-                await self._coord.api.set_position(round(target_position))
+                await self._coord.api.set_position(
+                    round(target_position), wake_first=self._needs_wake
+                )
                 self.async_write_ha_state()
             except BleakError as err:
                 LOGGER.error(
@@ -166,7 +176,7 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
             return
         try:
             self._target_position = OPEN_POSITION
-            await self._coord.api.open()
+            await self._coord.api.open(wake_first=self._needs_wake)
             self.async_write_ha_state()
         except BleakError as err:
             LOGGER.error("Failed to open cover '%s': %s", self.name, err)
@@ -179,7 +189,7 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
             return
         try:
             self._target_position = CLOSED_POSITION
-            await self._coord.api.close()
+            await self._coord.api.close(wake_first=self._needs_wake)
             self.async_write_ha_state()
         except BleakError as err:
             LOGGER.error("Failed to close cover '%s': %s", self.name, err)

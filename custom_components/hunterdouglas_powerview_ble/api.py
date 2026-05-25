@@ -226,43 +226,59 @@ class PowerViewBLE:
         tilt: int = 0x8000,
         velocity: int = 0x0,
         disconnect: bool = True,
+        wake_first: bool = False,
     ) -> None:
-        """Set position of device."""
+        """Set position of device.
+
+        wake_first: send the SET_POSITION frame twice with a 0.5s gap. Shades
+        in low-power state (service_required bit set in their advert) ACK
+        the first frame with error_code=0 but ignore it physically; the
+        second frame, sent while the motor is briefly awake, actually moves
+        the shade. Pass `wake_first=True` whenever the cover entity has
+        observed `service_required=on` for this shade.
+        """
         LOGGER.debug(
-            "%s setting position to %i/%i/%i, tilt %i, velocity %s",
+            "%s setting position to %i/%i/%i, tilt %i, velocity %s%s",
             self.name,
             pos1,
             pos2,
             pos3,
             tilt,
             velocity,
+            " (wake_first)" if wake_first else "",
         )
-        await self._cmd(
-            (
-                ShadeCmd.SET_POSITION,
-                int.to_bytes(pos1*100, 2, byteorder="little")
-                + int.to_bytes(pos2, 2, byteorder="little")
-                + int.to_bytes(pos3, 2, byteorder="little")
-                + int.to_bytes(tilt, 2, byteorder="little")
-                + int.to_bytes(velocity, 1),
-            ),
-            disconnect,
+        payload = (
+            ShadeCmd.SET_POSITION,
+            int.to_bytes(pos1 * 100, 2, byteorder="little")
+            + int.to_bytes(pos2, 2, byteorder="little")
+            + int.to_bytes(pos3, 2, byteorder="little")
+            + int.to_bytes(tilt, 2, byteorder="little")
+            + int.to_bytes(velocity, 1),
         )
+        if wake_first:
+            # First send wakes the motor but is ignored. Keep the connection
+            # open so the second send hits the same BLE session.
+            try:
+                await self._cmd(payload, disconnect=False)
+            except (BleakError, TimeoutError) as ex:
+                LOGGER.debug("%s wake-up send failed (ignored): %s", self.name, ex)
+            await asyncio.sleep(0.5)
+        await self._cmd(payload, disconnect)
 
-    async def open(self) -> None:
+    async def open(self, wake_first: bool = False) -> None:
         """Fully open cover."""
         LOGGER.debug("%s open", self.name)
-        await self.set_position(OPEN_POSITION, disconnect=False)
+        await self.set_position(OPEN_POSITION, disconnect=False, wake_first=wake_first)
 
     async def stop(self) -> None:
         """Stop device movement."""
         LOGGER.debug("%s stop", self.name)
         await self._cmd((ShadeCmd.STOP, b""))
 
-    async def close(self) -> None:
+    async def close(self, wake_first: bool = False) -> None:
         """Fully close cover."""
         LOGGER.debug("%s close", self.name)
-        await self.set_position(CLOSED_POSITION, disconnect=False)
+        await self.set_position(CLOSED_POSITION, disconnect=False, wake_first=wake_first)
 
     # uint8_t scene#, uint8_t unknown
     # open: scene 2
