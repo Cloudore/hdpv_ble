@@ -13,8 +13,9 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 
-from .const import LOGGER
+from .const import HOME_KEY as FALLBACK_HOME_KEY, LOGGER
 from .coordinator import PVCoordinator
+from .key_store import async_get_home_key
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
@@ -26,8 +27,16 @@ PLATFORMS: list[Platform] = [
 type ConfigEntryType = ConfigEntry[PVCoordinator]
 
 
+async def _resolve_home_key(hass: HomeAssistant) -> bytes:
+    """Return the persisted home key, or const.HOME_KEY fallback."""
+    stored = await async_get_home_key(hass)
+    if stored is not None:
+        return stored
+    return FALLBACK_HOME_KEY
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntryType) -> bool:
-    """Set up BT Battery Management System from a config entry."""
+    """Set up a single shade config entry."""
     LOGGER.debug("Setup of %s", repr(entry))
 
     if entry.unique_id is None:
@@ -42,7 +51,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntryType) -> bool
             f"Could not find PowerView device ({entry.unique_id}) via Bluetooth"
         )
 
-    coordinator = PVCoordinator(hass, ble_device, entry.data.copy())
+    home_key = await _resolve_home_key(hass)
+    coordinator = PVCoordinator(hass, ble_device, entry.data.copy(), home_key=home_key)
     try:
         await coordinator.query_dev_info()
     except BleakError as err:

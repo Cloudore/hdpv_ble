@@ -79,6 +79,17 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         return self._coord.device_info
 
     @property
+    def available(self) -> bool:
+        """Return True only when the shade has produced a recent V2 advert.
+
+        Without this gate, an out-of-range shade keeps reporting its last
+        known position indefinitely (e.g. stuck at "closed" while it is
+        actually open), because PassiveBluetoothCoordinatorEntity treats
+        any BLE address activity as "present".
+        """
+        return super().available and self._coord.data_available
+
+    @property
     def is_opening(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
         """Return if the cover is opening or not."""
         return bool(self._coord.data.get("is_opening")) or (

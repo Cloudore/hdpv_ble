@@ -57,6 +57,11 @@ class PVBinarySensor(PassiveBluetoothCoordinatorEntity[PVCoordinator], BinarySen
         super().__init__(coord)
 
     @property
+    def available(self) -> bool:
+        """Gate availability on freshness of decoded V2 advert."""
+        return super().available and self.coordinator.data_available
+
+    @property
     def is_on(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
         """Handle updated data from the coordinator."""
         return bool(self.coordinator.data.get(self.entity_description.key))

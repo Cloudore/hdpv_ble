@@ -68,6 +68,18 @@ class PVSensor(PassiveBluetoothCoordinatorEntity[PVCoordinator], SensorEntity): 
         super().__init__(pv_dev)
 
     @property
+    def available(self) -> bool:
+        """Gate availability on freshness of decoded V2 advert.
+
+        RSSI is exempt — it updates on every BLE event regardless of payload,
+        so it's a useful indicator of raw link presence even when V2 frames
+        stop decoding.
+        """
+        if self.entity_description.key == ATTR_RSSI:
+            return super().available
+        return super().available and self.coordinator.data_available
+
+    @property
     def native_value(self) -> int | float | None:  # type: ignore[reportIncompatibleVariableOverride]
         """Return the sensor value."""
         return self.coordinator.data.get(self.entity_description.key)

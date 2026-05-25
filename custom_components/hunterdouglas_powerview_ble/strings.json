@@ -2,14 +2,45 @@
   "config": {
     "flow_title": "Setup {name}",
     "step": {
+      "user": {
+        "title": "Hunter Douglas PowerView (BLE)",
+        "description": "What do you want to set up?",
+        "menu_options": {
+          "extract_key": "Extract home key from a PowerView gateway",
+          "shade": "Pair a PowerView shade (Bluetooth)"
+        }
+      },
+      "extract_key": {
+        "title": "Extract home key from gateway",
+        "description": "Enter the address of your PowerView Gen3 gateway. The integration will fetch the AES home key once and store it permanently — the gateway is only needed for this one call, after which it can be offline or out of range.",
+        "data": {
+          "host": "Gateway address (URL, hostname, or IP)"
+        }
+      },
+      "extract_key_confirm": {
+        "title": "PowerView gateway discovered",
+        "description": "Fetch the home key from the gateway at {host}?"
+      },
       "bluetooth_confirm": {
         "description": "[%key:component::bluetooth::config::step::bluetooth_confirm::description%]"
+      },
+      "pick_shade": {
+        "title": "Pair a PowerView shade",
+        "description": "Pick a shade that's currently advertising via Bluetooth.",
+        "data": {
+          "address": "Shade"
+        }
       }
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
       "no_devices_found": "[%key:common::config_flow::abort::no_devices_found%]",
-      "not_supported": "Device not supported"
+      "not_supported": "Device not supported",
+      "home_key_saved": "Home key extracted and saved. Existing shade entries are reloading to use it.",
+      "home_key_already_saved": "A home key is already saved for this installation. Use the integration menu to re-extract if it has changed."
+    },
+    "error": {
+      "cannot_connect": "Could not reach the gateway or extract a home key. Check the address and that the gateway has paired shades."
     }
   }
 }
