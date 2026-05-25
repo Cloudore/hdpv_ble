@@ -5,6 +5,7 @@ from typing import Any
 
 from bleak.backends.device import BLEDevice
 
+from homeassistant.components.cover import ATTR_CURRENT_POSITION
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.const import DOMAIN as BLUETOOTH_DOMAIN
 from homeassistant.components.bluetooth.passive_update_coordinator import (
@@ -49,6 +50,7 @@ class PVCoordinator(PassiveBluetoothDataUpdateCoordinator):
         self._manuf_dat = data.get("manufacturer_data")
         self.dev_details: dict[str, str] = {}
         self._last_v2_ts: float | None = None
+        self._last_position: float | None = None
 
         LOGGER.debug(
             "Initializing coordinator for %s (%s)",
@@ -165,6 +167,25 @@ class PVCoordinator(PassiveBluetoothDataUpdateCoordinator):
                 # are present (Cipher is built only on a 16-byte HOME_KEY).
                 self.api.encrypted = bool(self.data.pop("home_id", 0))
                 self._last_v2_ts = time.time()
+                # Override the V2 movement bits with the direction inferred
+                # from position delta. Some KDT curtain firmwares encode
+                # the is_opening/is_closing bits with the opposite meaning
+                # of ACR rollers — symptom was HomeKit showing "Closing"
+                # while a curtain was physically opening. Position itself
+                # is unambiguous: increasing = opening, decreasing = closing,
+                # stable = stopped.
+                new_pos = self.data.get(ATTR_CURRENT_POSITION)
+                if new_pos is not None and self._last_position is not None:
+                    if new_pos > self._last_position:
+                        self.data["is_opening"] = True
+                        self.data["is_closing"] = False
+                    elif new_pos < self._last_position:
+                        self.data["is_opening"] = False
+                        self.data["is_closing"] = True
+                    else:
+                        self.data["is_opening"] = False
+                        self.data["is_closing"] = False
+                self._last_position = new_pos
 
         LOGGER.debug("data sample %s", self.data)
         super()._async_handle_bluetooth_event(service_info, change)
