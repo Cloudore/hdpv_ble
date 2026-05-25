@@ -197,19 +197,33 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         return self._pinned_direction is not None and self._target_is_fresh()
 
     def _has_settled(self) -> bool:
-        """True iff the last position change was longer than SETTLED_AFTER ago.
+        """True iff the motor is no longer moving toward the current target.
 
-        Position-stability proxy for "motor stopped". Used by is_opening /
-        is_closing to keep the entity in a moving state through the *last
-        few percent* of a move where the position is still ticking up but
-        within a naive `target - current` deadzone would already snap to
-        "open"/"closed". A single such non-moving frame is enough for HA's
-        HomeKit Bridge to clobber HK's TargetPosition (it resets Target to
-        Current whenever the entity is not in MOVING_STATES) — which then
-        flips iOS's direction label backwards for the rest of the move.
+        Position-stability proxy for "motor stopped". Two-stage:
+
+        1. If the most recent position change happened *before* the current
+           target was set, the motor hasn't reacted to the command yet —
+           treat as NOT settled. Without this, a shade that's been stable
+           for hours would be reported as settled the instant a fresh
+           command lands, and the next BLE advert (still at the pre-move
+           position) would write a non-moving "open"/"closed" frame *while
+           the motor is just about to start*. HA's HomeKit Bridge clobbers
+           HK's TargetPosition on any non-moving frame, flipping iOS's
+           direction label backwards for the rest of the move.
+
+        2. Once the position has changed at least once *after* the command,
+           settled is True only if the last change was more than
+           SETTLED_AFTER seconds ago.
         """
         if self._last_position_change_ts is None:
-            return True  # never seen a position → not moving
+            # never seen a position update — leave is_opening/is_closing free
+            # to fall through to their own checks
+            return True
+        if (
+            self._target_set_at is not None
+            and self._last_position_change_ts < self._target_set_at
+        ):
+            return False
         return (time.time() - self._last_position_change_ts) > self.SETTLED_AFTER
 
     @property
