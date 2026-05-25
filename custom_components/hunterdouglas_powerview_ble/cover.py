@@ -100,14 +100,20 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         """
         await super().async_added_to_hass()
         self.async_on_remove(
-            self.hass.bus.async_listen(
-                "homekit_state_change", self._on_homekit_event
-            )
+            self.hass.bus.async_listen("homekit_state_change", self._on_homekit_event)
         )
 
     @callback
     def _on_homekit_event(self, event: Event) -> None:
-        """Pin direction the moment iOS issues a position command."""
+        """Pin direction the moment iOS issues a position command.
+
+        Filters to this entity's set_cover_position events only. Pins so a
+        BLE advert that lands between this event and the service-call task
+        running can't write a non-moving state and trip the Bridge into
+        clobbering HK's TargetPosition. If the service-call task never
+        runs (e.g. entity briefly went unavailable), the pin self-expires
+        via `_pin_is_valid` after TARGET_TTL.
+        """
         if event.data.get(ATTR_ENTITY_ID) != self.entity_id:
             return
         if event.data.get("service") != "set_cover_position":
@@ -119,15 +125,7 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         if current is None or int(value) == current:
             return
         direction = STATE_OPENING if int(value) > current else STATE_CLOSING
-        LOGGER.debug(
-            "%s: HomeKit command target=%s current=%s -> pinning %s",
-            self.entity_id,
-            int(value),
-            current,
-            direction,
-        )
         self._pin_direction(direction)
-        # Pre-set target so subsequent state recomputes are consistent.
         self._set_target(int(value))
         self.async_write_ha_state()
 
@@ -138,14 +136,30 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @property
     def available(self) -> bool:
-        """Return True only when the shade has produced a recent V2 advert.
+        """Always controllable as long as the BLE address is reachable.
 
-        Without this gate, an out-of-range shade keeps reporting its last
-        known position indefinitely (e.g. stuck at "closed" while it is
-        actually open), because PassiveBluetoothCoordinatorEntity treats
-        any BLE address activity as "present".
+        Hunter Douglas shades — especially ACR rollers — back off their
+        V2 advert cadence after a few minutes of idle and may not transmit
+        again for hours. They still accept BLE writes the entire time and
+        wake on command. Gating `available` on advert freshness here would
+        make HA refuse to dispatch service calls (logs a "Referenced entity
+        ... not currently available" warning and the command is dropped),
+        which breaks every UI surface the user controls the shade from.
+
+        Stale advert data is surfaced via `assumed_state` instead — the
+        UI shows the "assumed" indicator without blocking commands.
         """
-        return super().available and self._coord.data_available
+        return super().available
+
+    @property
+    def assumed_state(self) -> bool:
+        """True when the cached position is older than STALE_AFTER seconds.
+
+        Tells the UI not to fully trust `current_cover_position` — the
+        shade may have been moved by remote / wall switch since the last
+        advert we decoded.
+        """
+        return not self._coord.data_available
 
     # Direction inference. The shade's advert movement bits are
     # unreliable: KDT curtain firmwares invert is_opening / is_closing
@@ -177,11 +191,23 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
             return False
         return (time.time() - self._target_set_at) < self.TARGET_TTL
 
+    def _pin_is_valid(self) -> bool:
+        """Pin is honored only while the matching target is fresh.
+
+        Backstop for cases where a pin is set (by `_on_homekit_event` or
+        by a command method) but never released — e.g. the service call
+        failed to dispatch, or the BLE write raised an unhandled exception.
+        After TARGET_TTL the pin is treated as released and the entity
+        falls back to advert-derived state, so the user isn't stuck
+        looking at "Opening..." forever.
+        """
+        return self._pinned_direction is not None and self._target_is_fresh()
+
     @property
     def is_opening(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
         """True while the shade is being driven upward."""
-        if self._pinned_direction == STATE_OPENING:
-            return True
+        if self._pin_is_valid():
+            return self._pinned_direction == STATE_OPENING
         if not self._target_is_fresh():
             return False
         current = self.current_cover_position
@@ -192,8 +218,8 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
     @property
     def is_closing(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
         """True while the shade is being driven downward."""
-        if self._pinned_direction == STATE_CLOSING:
-            return True
+        if self._pin_is_valid():
+            return self._pinned_direction == STATE_CLOSING
         if not self._target_is_fresh():
             return False
         current = self.current_cover_position
@@ -203,14 +229,7 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @property
     def is_closed(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
-        """Return if the cover is closed.
-
-        Uses the same DIRECTION_DEADZONE as is_opening / is_closing so a
-        motor that settles 1-2% short of fully closed (common end-of-
-        travel calibration drift) doesn't bounce between "open" and
-        "closed" in HomeKit. Returns None when position is unknown so
-        HA reports the entity as 'unknown' rather than assuming "open".
-        """
+        """Return if the cover is closed."""
         pos = self.current_cover_position
         if pos is None:
             return None
@@ -289,20 +308,13 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         """
         self._pinned_direction = direction
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Forward coordinator updates to async_write_ha_state.
-
-        Skipped while a command is in flight (_pinned_direction set)
-        because a BLE advert arriving in the same event-loop tick as
-        the user's command would otherwise win the race, write state
-        as a non-moving 'open' / 'closed' frame, and trip HA's
-        HomeKit Bridge into clobbering HK's TargetPosition — which
-        flips the iOS direction label for the rest of the move.
-        """
-        if self._pinned_direction is not None:
-            return
-        super()._handle_coordinator_update()
+    # _handle_coordinator_update is NOT overridden anymore — every BLE
+    # advert should drive an async_write_ha_state so HomeKit gets live
+    # CurrentPosition updates while the shade physically moves. The pin
+    # (set by either _on_homekit_event or the command method itself)
+    # ensures is_opening / is_closing return True throughout, so each
+    # advert-driven state recomputation stays in a moving state and
+    # never trips the Bridge into resetting HK's TargetPosition.
 
     def _reset_target_position(self) -> None:
         self._target_position = None
