@@ -18,7 +18,8 @@ from homeassistant.components.cover import (
     CoverEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import STATE_CLOSING, STATE_OPENING
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo, format_mac
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -71,6 +72,15 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         # Used by is_opening / is_closing to expire stale targets after
         # TARGET_TTL seconds (see those properties for the rationale).
         self._target_set_at: float | None = None
+        # Optional 'opening' / 'closing' override that pins the direction
+        # while a command is in flight. Necessary because the entity can
+        # otherwise pass through a transient 'open' or 'closed' state
+        # within the same event-loop tick as the command (e.g. if a BLE
+        # advert arrives just before async_set_cover_position runs), and
+        # HA's HomeKit Bridge clobbers HK's TargetPosition any time the
+        # entity is not in a moving state — breaking the iOS direction
+        # label for the rest of the move. See _pin_direction().
+        self._pinned_direction: str | None = None
         self._attr_unique_id = (
             f"{DOMAIN}_{format_mac(self._coord.address)}_{CoverDeviceClass.SHADE}"
         )
@@ -110,6 +120,11 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
     # when the user has since moved the shade by remote.
 
     DIRECTION_DEADZONE = 2
+    ENDPOINT_DEADZONE = 5  # is_closed deadzone — wider than DIRECTION_DEADZONE
+    # to absorb noisy adverts that briefly report 3-4 from a settled-closed
+    # shade and would otherwise flip the entity from "closed" to "open" right
+    # before a HomeKit command runs, tripping HA's Bridge into resetting
+    # HK's TargetPosition.
     TARGET_TTL = 60.0  # seconds since last command
 
     def _target_is_fresh(self) -> bool:
@@ -119,7 +134,9 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @property
     def is_opening(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
-        """True while a fresh command is still driving the shade upward."""
+        """True while the shade is being driven upward."""
+        if self._pinned_direction == STATE_OPENING:
+            return True
         if not self._target_is_fresh():
             return False
         current = self.current_cover_position
@@ -129,7 +146,9 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @property
     def is_closing(self) -> bool | None:  # type: ignore[reportIncompatibleVariableOverride]
-        """True while a fresh command is still driving the shade downward."""
+        """True while the shade is being driven downward."""
+        if self._pinned_direction == STATE_CLOSING:
+            return True
         if not self._target_is_fresh():
             return False
         current = self.current_cover_position
@@ -150,7 +169,7 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         pos = self.current_cover_position
         if pos is None:
             return None
-        return pos <= CLOSED_POSITION + self.DIRECTION_DEADZONE
+        return pos <= CLOSED_POSITION + self.ENDPOINT_DEADZONE
 
     @property
     def supported_features(self) -> CoverEntityFeature:  # type: ignore[reportIncompatibleVariableOverride]
@@ -182,50 +201,74 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position.
 
-        State is written immediately (before the BLE await) so the entity
-        is in 'opening'/'closing' from the instant the command lands. HA's
-        HomeKit Bridge resets HK's TargetPosition to CurrentPosition any
-        time the entity is *not* in a moving state — if even a single
-        non-moving frame leaks through during the command's BLE round-trip,
-        HK forgets the user's actual target and ends up displaying the
-        direction backwards for the rest of the move.
+        Pins the entity to STATE_OPENING / STATE_CLOSING for the duration
+        of the command so HA's HomeKit Bridge never sees a non-moving
+        frame mid-command — see _pin_direction() and is_opening for the
+        full rationale.
         """
         target_position: Final = kwargs.get(ATTR_POSITION)
         if target_position is None:
             return
-        LOGGER.debug("set cover to position %f", target_position)
-        if self.current_cover_position == round(target_position) and not (
+        target = round(target_position)
+        LOGGER.debug("set cover to position %d", target)
+        if self.current_cover_position == target and not (
             self.is_closing or self.is_opening
         ):
             return
-        self._set_target(round(target_position))
+        current = self.current_cover_position
+        if current is not None:
+            self._pin_direction(STATE_OPENING if target > current else STATE_CLOSING)
+        self._set_target(target)
         self.async_write_ha_state()
         try:
-            await self._coord.api.set_position(
-                round(target_position), wake_first=self._needs_wake
-            )
+            await self._coord.api.set_position(target, wake_first=self._needs_wake)
         except BleakError as err:
             LOGGER.error(
-                "Failed to move cover '%s' to %f%%: %s",
-                self.name,
-                target_position,
-                err,
+                "Failed to move cover '%s' to %d%%: %s", self.name, target, err
             )
+        finally:
+            self._pin_direction(None)
 
     def _set_target(self, position: int) -> None:
         """Record a new target position and stamp its freshness window."""
         self._target_position = position
         self._target_set_at = time.time()
 
+    def _pin_direction(self, direction: str | None) -> None:
+        """Pin is_opening / is_closing to a specific direction.
+
+        Used inside command handlers to guarantee the entity enters
+        STATE_OPENING / STATE_CLOSING immediately and stays there until
+        we clear it, regardless of what a racing BLE advert would
+        otherwise compute from target-vs-current. Pass None to release.
+        """
+        self._pinned_direction = direction
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Forward coordinator updates to async_write_ha_state.
+
+        Skipped while a command is in flight (_pinned_direction set)
+        because a BLE advert arriving in the same event-loop tick as
+        the user's command would otherwise win the race, write state
+        as a non-moving 'open' / 'closed' frame, and trip HA's
+        HomeKit Bridge into clobbering HK's TargetPosition — which
+        flips the iOS direction label for the rest of the move.
+        """
+        if self._pinned_direction is not None:
+            return
+        super()._handle_coordinator_update()
+
     def _reset_target_position(self) -> None:
         self._target_position = None
         self._target_set_at = None
 
     async def async_open_cover(self, **kwargs: Any) -> None:
-        """Open the cover. Write moving state immediately so HK keeps Target."""
+        """Open the cover. Pins direction so HK keeps TargetPosition."""
         LOGGER.debug("open cover")
         if self.current_cover_position == OPEN_POSITION:
             return
+        self._pin_direction(STATE_OPENING)
         self._set_target(OPEN_POSITION)
         self.async_write_ha_state()
         try:
@@ -233,12 +276,15 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         except BleakError as err:
             LOGGER.error("Failed to open cover '%s': %s", self.name, err)
             self._reset_target_position()
+        finally:
+            self._pin_direction(None)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
-        """Close the cover. Write moving state immediately so HK keeps Target."""
+        """Close the cover. Pins direction so HK keeps TargetPosition."""
         LOGGER.debug("close cover")
         if self.current_cover_position == CLOSED_POSITION:
             return
+        self._pin_direction(STATE_CLOSING)
         self._set_target(CLOSED_POSITION)
         self.async_write_ha_state()
         try:
@@ -246,6 +292,8 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
         except BleakError as err:
             LOGGER.error("Failed to close cover '%s': %s", self.name, err)
             self._reset_target_position()
+        finally:
+            self._pin_direction(None)
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Stop the cover."""
