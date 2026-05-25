@@ -45,8 +45,8 @@
     },
     "entity": {
         "binary_sensor": {
-            "service_required": {
-                "name": "Service required"
+            "low_power_mode": {
+                "name": "Low power mode"
             }
         }
     }

@@ -210,11 +210,11 @@ class PowerViewBLE:
             #     actively tracking position (e.g. during a remote-
             #     triggered move)
             #   * snaps back on as soon as the motor settles
-            # Best read as a "motor in low-power state" flag. When on,
-            # SET_POSITION frames are ACK'd with error_code=0 but the
-            # motor ignores them; clears reliably after a calibration
-            # via the PowerView app or a full-range manual move.
-            ("service_required", bool(data[8] & 0x4)),
+            # Best read as a "motor is in low-power / sleep" flag. When
+            # set, SET_POSITION frames are ACK'd with error_code=0 but
+            # the motor ignores them — the integration sends a wake-up
+            # frame first (see api.set_position wake_first kwarg).
+            ("low_power_mode", bool(data[8] & 0x4)),
         ]
 
     # position cmd: uint16_t pos1, uint16_t pos2, uint16_t pos3, uint16_t tilt, uint8_t velocity
@@ -231,11 +231,11 @@ class PowerViewBLE:
         """Set position of device.
 
         wake_first: send the SET_POSITION frame twice with a 0.5s gap. Shades
-        in low-power state (service_required bit set in their advert) ACK
+        in low-power state (low_power_mode bit set in their advert) ACK
         the first frame with error_code=0 but ignore it physically; the
         second frame, sent while the motor is briefly awake, actually moves
         the shade. Pass `wake_first=True` whenever the cover entity has
-        observed `service_required=on` for this shade.
+        observed `low_power_mode=on` for this shade.
         """
         LOGGER.debug(
             "%s setting position to %i/%i/%i, tilt %i, velocity %s%s",

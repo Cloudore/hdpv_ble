@@ -24,9 +24,12 @@ BINARY_SENSOR_TYPES: list[BinarySensorEntityDescription] = [
         device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
     ),
     BinarySensorEntityDescription(
-        key="service_required",
-        translation_key="service_required",
-        device_class=BinarySensorDeviceClass.PROBLEM,
+        # Reflects bit 0x04 of advert byte 8 — set when the motor is in
+        # low-power / sleep state. The integration auto-wakes via the
+        # wake_first path in api.set_position, so this is purely
+        # diagnostic (no device_class=problem).
+        key="low_power_mode",
+        translation_key="low_power_mode",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 ]

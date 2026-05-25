@@ -137,11 +137,11 @@ class PowerViewCover(PassiveBluetoothCoordinatorEntity[PVCoordinator], CoverEnti
 
     @property
     def _needs_wake(self) -> bool:
-        """True when the shade is in low-power state and needs a double-send.
+        """True when the shade is in low-power mode and needs a double-send.
 
         See api.set_position(wake_first=...) for the rationale.
         """
-        return bool(self._coord.data.get("service_required"))
+        return bool(self._coord.data.get("low_power_mode"))
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position."""

@@ -146,7 +146,7 @@ class PVCoordinator(PassiveBluetoothDataUpdateCoordinator):
             "battery_charging",
             "resetMode",
             "resetClock",
-            "service_required",
+            "low_power_mode",
         ):
             self.data.pop(_k, None)
         if change == bluetooth.BluetoothChange.ADVERTISEMENT:
